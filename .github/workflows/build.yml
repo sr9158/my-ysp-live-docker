@@ -45,7 +45,7 @@ jobs:
 
           git add source_backup/
           git commit -m "🤖 自动备份上游源码 [skip ci]" || echo "源码没有变化，无需备份"
-          git push
+          git push origin HEAD:main --force
 
       - name: 设置 Docker Buildx (多平台构建)
         uses: docker/setup-buildx-action@v3

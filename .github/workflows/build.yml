@@ -37,10 +37,14 @@ jobs:
           cp -a /tmp/upstream/* source_backup/
           cp -a /tmp/upstream/.[!.]* source_backup/ 2>/dev/null || true
           
+          # ⬇️ 关键修复：清理子模块缓存和嵌套 .git
+          git rm -rf --cached source_backup/.git 2>/dev/null || true
+          find source_backup -name ".git" -type f -exec rm -f {} \; 2>/dev/null || true
+          find source_backup -name ".git" -type d -exec rm -rf {} + 2>/dev/null || true
+
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           
-          # ⬇️ 关键修复：在推送前，明确使用 GITHUB_TOKEN 设置远程仓库地址
           git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
 
           git add source_backup/

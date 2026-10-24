@@ -26,7 +26,7 @@ jobs:
           # 把原作者的所有文件复制到当前工作目录（用于构建）
           cp -a /tmp/upstream/* .
           cp -a /tmp/upstream/.[!.]* . 2>/dev/null || true
-          rm -rf .git
+          #rm -rf .git
 
       - name: 自动备份源码到你的仓库
         run: |

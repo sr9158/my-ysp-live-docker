@@ -1,0 +1,75 @@
+name: 自动同步并构建镜像
+
+on:
+  schedule:
+    - cron: '0 0 * * *' # 每天北京时间早上 8 点自动运行
+  workflow_dispatch: # 允许手动点击运行
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # 注意这里改成了 write，允许机器人把代码推回你的仓库
+      packages: write
+
+    steps:
+      - name: 检出你自己的仓库
+        uses: actions/checkout@v4
+
+      - name: 拉取原作者最新代码
+        run: |
+          git clone --depth 1 https://github.com/evanzme/ysp-live.git /tmp/upstream
+          # 把原作者的所有文件复制到当前工作目录（用于构建）
+          cp -a /tmp/upstream/* .
+          cp -a /tmp/upstream/.[!.]* . 2>/dev/null || true
+          rm -rf .git
+
+      - name: 自动备份源码到你的仓库
+        run: |
+          # 把拉下来的源码存到你仓库的 source_backup 文件夹里
+          mkdir -p source_backup
+          cp -a /tmp/upstream/* source_backup/
+          cp -a /tmp/upstream/.[!.]* source_backup/ 2>/dev/null || true
+          
+          # 配置机器人的身份
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # 提交并推送到你的仓库
+          git add source_backup/
+          git commit -m "🤖 自动备份上游源码 [skip ci]" || echo "源码没有变化，无需备份"
+          git push
+
+      - name: 设置 Docker Buildx (多平台构建)
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GitHub 镜像仓库
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 生成镜像标签
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=schedule,pattern=nightly-{{date 'YYYYMMDD'}}
+            type=raw,value=latest
+
+      - name: 构建并推送镜像
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

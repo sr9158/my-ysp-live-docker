@@ -2,8 +2,9 @@ name: 全自动构建 YSP-Live 镜像
 
 on:
   schedule:
+    # 每天 UTC 00:00 (北京时间早上 8:00) 自动运行
     - cron: '0 0 * * *'
-  workflow_dispatch:
+  workflow_dispatch: # 支持在网页端手动点击运行
 
 jobs:
   build:
@@ -16,31 +17,36 @@ jobs:
       - name: 1. 检出你自己的仓库
         uses: actions/checkout@v4
 
-      - name: 2. 获取原仓库的基础构建文件 (Dockerfile等)
+      - name: 2. 解压源码并铺平到根目录
         run: |
-          git clone --depth 1 https://github.com/evanzme/ysp-live.git /tmp/base
-          cp -a /tmp/base/* .
-          cp -a /tmp/base/.[!.]* . 2>/dev/null || true
-
-      - name: 3. 解压你自己上传的 ZIP 包
-        run: |
-          # 直接解压当前仓库里的 zip 文件
-          unzip -o ysp-live-docker-v9.5.zip -d /tmp/unzip
-          # 将解压出来的新源码覆盖到当前目录
+          # 自动查找仓库里唯一的 zip 文件（不管版本号是多少）
+          ZIP_FILE=$(ls *.zip | head -n 1)
+          if [ -z "$ZIP_FILE" ]; then
+            echo "❌ 错误：未在当前仓库找到 ZIP 文件！请确保已上传。"
+            exit 1
+          fi
+          echo "🔍 找到源码包: $ZIP_FILE"
+          
+          # 解压到临时目录
+          unzip -o "$ZIP_FILE" -d /tmp/unzip
+          
+          # 使用 find 命令，把解压出来的所有文件（无视目录层级）全部抓取到当前根目录
           find /tmp/unzip -type f -exec cp -a {} . \;
-          echo "✅ 源码替换完成！"
+          
+          echo "✅ 提取完成，当前根目录包含以下核心文件："
+          ls -la | grep -E "Dockerfile|\.py|\.js"
 
-      - name: 4. 设置 Docker Buildx (多平台构建)
+      - name: 3. 设置 Docker Buildx (多平台构建)
         uses: docker/setup-buildx-action@v3
 
-      - name: 5. 登录 GitHub 镜像仓库
+      - name: 4. 登录 GitHub 镜像仓库
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 6. 生成镜像标签
+      - name: 5. 生成镜像标签
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -48,8 +54,9 @@ jobs:
           tags: |
             type=raw,value=latest
             type=schedule,pattern=nightly-{{date 'YYYYMMDD'}}
+            type=sha,format=short
 
-      - name: 7. 构建并推送镜像
+      - name: 6. 构建并推送镜像
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -57,3 +64,5 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

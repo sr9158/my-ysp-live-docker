@@ -70,8 +70,13 @@ jobs:
           set -euo pipefail
 
           BASE="${BASE_URL%/}"
+          HOST="${BASE#*://}"; HOST="${HOST%%/*}"
           MAX_PROBES="${MAX_MINOR_PROBES:-30}"
           MANUAL="${MANUAL_URL:-}"
+          # 模仿浏览器，避免被对象存储 / WAF 以“非浏览器请求”为由拒绝
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+          CODES=/tmp/ysp-probe-codes.txt
+          : > "$CODES"
 
           OLD_ZIP=$(find . -maxdepth 1 -type f -name 'ysp-live-docker-v*.zip' -printf '%f\n' 2>/dev/null | sort -V | tail -n1 || true)
           OLD_ZIP="${OLD_ZIP:-}"
@@ -104,21 +109,17 @@ jobs:
             echo "🔗 使用手动指定地址：$ZIP_URL"
           else
             # 探测某个版本是否存在（上游只有“当前版本”这一份文件，旧版本会被删除）
+            # 用 Range GET（只取 1 字节）而不是 HEAD：不少 WAF 会拦 HEAD，GET 才是真实下载路径
             probe() {
-              local code
-              code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 -I \
-                     "$BASE/ysp-live-docker-v$1.$2.zip" 2>/dev/null || true)
+              local url code
+              url="$BASE/ysp-live-docker-v$1.$2.zip"
+              code=$(curl -sS --connect-timeout 10 --max-time 25 -o /dev/null \
+                       -w '%{http_code}' -A "$UA" -H 'Accept: */*' -r 0-0 \
+                       "$url" 2>/dev/null || true)
+              code="${code:-000}"
+              printf 'v%s.%s %s\n' "$1" "$2" "$code" >> "$CODES"
               case "$code" in
-                200) return 0 ;;
-                # 个别对象存储不允许 HEAD，用 Range 请求再确认一次
-                403|405|501)
-                  code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 -r 0-0 \
-                         "$BASE/ysp-live-docker-v$1.$2.zip" 2>/dev/null || true)
-                  case "$code" in
-                    200|206) return 0 ;;
-                    *) return 1 ;;
-                  esac
-                  ;;
+                200|206) return 0 ;;
                 *) return 1 ;;
               esac
             }
@@ -149,10 +150,34 @@ jobs:
             done
           fi
 
-          # 上游探测失败：有旧包就跳过（不报红），没有旧包才真正失败
+          # 上游探测失败：把诊断信息写进 Step Summary，方便直接定位原因
           if [ -z "$ZIP_URL" ]; then
+            SAMPLE_URL="$BASE/ysp-live-docker-v${CUR_MAJOR}.${CUR_MINOR}.zip"
+            {
+              echo "### 🔍 上游探测诊断"
+              echo ""
+              echo '```text'
+              echo "探测目标   : $BASE"
+              echo -n "DNS 解析   : "; getent ahosts "$HOST" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ' || true; echo
+              echo "状态码分布 : $(awk '{print $2}' "$CODES" | sort | uniq -c | awk '{printf "%s×%s ", $2, $1}')"
+              echo -n "无 UA 的 Range GET : "
+              curl -sS -o /dev/null -w '%{http_code} (耗时 %{time_total}s)\n' --connect-timeout 10 --max-time 25 \
+                   -r 0-0 "$SAMPLE_URL" 2>&1 || echo "curl 失败"
+              echo -n "浏览器 UA 的完整 GET : "
+              curl -sS -o /dev/null -w '%{http_code} (耗时 %{time_total}s, %{size_download} 字节)\n' \
+                   --connect-timeout 10 --max-time 60 -A "$UA" "$SAMPLE_URL" 2>&1 || echo "curl 失败"
+              echo -n "对照: runner 出口 IP : "; curl -sS --max-time 15 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -E '^(ip|loc|colo)=' | tr '\n' ' ' || true; echo
+              echo "响应头:"
+              curl -sS -D - -o /dev/null --connect-timeout 10 --max-time 25 -r 0-0 "$SAMPLE_URL" 2>&1 | head -15 || true
+              echo '```'
+              echo ""
+              echo "> 403 / challenge → 上游 CDN 拦截了 GitHub Actions 的出口 IP"
+              echo "> 000 / DNS 为空 → runner 解析不到或连不上该域名"
+              echo "> 200 → 探测逻辑问题（把这段贴给我）"
+            } | tee /tmp/ysp-diag.txt >> "$GITHUB_STEP_SUMMARY"
+
             if [ -n "$OLD_ZIP" ]; then
-              echo "::warning::上游未探测到可下载的源码包，本次跳过（保留仓库现有 ${OLD_ZIP}）"
+              echo "::warning::上游未探测到可下载的源码包，本次跳过（保留仓库现有 ${OLD_ZIP}），诊断见 Step Summary"
               {
                 echo "version=v${CUR_MAJOR}.${CUR_MINOR}"
                 echo "zip_url="
@@ -163,7 +188,7 @@ jobs:
               } >> "$GITHUB_OUTPUT"
               exit 0
             fi
-            echo "::error::未能定位上游源码包（v${CUR_MAJOR}.* 均不可用），请检查 BASE_URL，或用 source_url 手动指定地址"
+            echo "::error::未能定位上游源码包（v${CUR_MAJOR}.* 均不可用），诊断见 Step Summary；也可用 source_url 手动指定地址"
             exit 1
           fi
 
@@ -178,7 +203,8 @@ jobs:
             NEW_NAME="$(basename "$ZIP_URL")"
           fi
 
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --max-time 300 -o "$TMP_ZIP" "$ZIP_URL"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 15 --max-time 300 \
+               -A "$UA" -H 'Accept: */*' -o "$TMP_ZIP" "$ZIP_URL"
           SIZE=$(stat -c%s "$TMP_ZIP")
           echo "📦 下载完成：${NEW_NAME}（${SIZE} 字节）"
 

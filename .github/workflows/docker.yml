@@ -1,96 +1,416 @@
+# =============================================================================
+# 全自动构建 YSP-Live Docker 镜像
+# -----------------------------------------------------------------------------
+# 相比旧版的变化：不再需要手动下载 zip 再上传到本仓库。
+# 每次运行都会：
+#   1) 自动探测上游最新版本（形如 ysp-live-docker-v11.3.zip）
+#   2) 下载并校验（ZIP 完整性 + 是否含 Dockerfile）+ 计算 SHA256
+#   3) 与仓库里已有的同版本包比对，只有变化时才构建
+#   4) 构建并推送多架构镜像到 ghcr.io，打完标签后把新 zip 提交回仓库
+# 旧网址（如 v11.2）在上游会被删除，所以“探测版本号”比“固定 URL 算哈希”更可靠。
+# =============================================================================
 name: 全自动构建 YSP-Live 镜像
 
 on:
   schedule:
-    # 每天 UTC 00:00 (北京时间早上 8:00) 兜底检查，如果没变会自动跳过
-    - cron: '0 0 * * *'
+    # UTC 03:17 / 15:17 = 北京时间 11:17 / 23:17，每天检查两次上游更新
+    # 想改成每天一次就只留下面第一行，想更频繁就再加一条 cron
+    - cron: '17 3 * * *'
+    - cron: '17 15 * * *'
   push:
-    # 只要上传或修改了 zip 文件，立刻触发构建
+    # 手动上传 / 替换 zip 时也立刻触发（会被自动检测逻辑接管）
     paths:
       - '*.zip'
-  workflow_dispatch: # 支持手动点击
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: '强制重新构建（即使上游版本没有变化，例如镜像被误删后需要重建）'
+        type: boolean
+        default: false
+      source_url:
+        description: '手动指定源码包完整地址（留空 = 自动探测最新版本）'
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: write   # 需要把新下载的 zip 提交回本仓库
+  packages: write   # 需要推送镜像到 ghcr.io
+
+# 同一时间只跑一个，避免定时任务和手动触发互相踩踏
+concurrency:
+  group: ysp-live-build
+  cancel-in-progress: false
+
+env:
+  # 上游目录（末尾不要带斜杠）；也可在仓库 Settings → Variables 里用 YSP_SOURCE_URL 覆盖成固定地址
+  BASE_URL: 'https://garysclub.sharewithyou.dpdns.org/ysp-live'
+  # 从当前版本往后最多探测多少个小版本（vX.当前..vX.当前+N）
+  MAX_MINOR_PROBES: '30'
+  # 构建平台，按需改成 linux/amd64 可显著缩短构建时间
+  PLATFORMS: 'linux/amd64,linux/arm64'
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
+    timeout-minutes: 120
 
     steps:
-      - name: 1. 检出你自己的仓库
+      - name: 1. 检出仓库
         uses: actions/checkout@v4
 
-      - name: 2. 计算 ZIP 包指纹 (哈希值)
-        id: get-hash
+      # ---------------------------------------------------------------------
+      # 自动检测 + 下载：只在此步骤里访问上游，后面的步骤都用它的输出
+      # ---------------------------------------------------------------------
+      - name: 2. 探测上游最新版本并下载
+        id: detect
+        env:
+          MANUAL_URL: ${{ inputs.source_url || vars.YSP_SOURCE_URL }}
         run: |
-          ZIP_FILE=$(ls *.zip | head -n 1)
-          if [ -z "$ZIP_FILE" ]; then
-            echo "❌ 错误：未在当前仓库找到 ZIP 文件！"
+          set -euo pipefail
+
+          BASE="${BASE_URL%/}"
+          MAX_PROBES="${MAX_MINOR_PROBES:-30}"
+          MANUAL="${MANUAL_URL:-}"
+
+          OLD_ZIP=$(find . -maxdepth 1 -type f -name 'ysp-live-docker-v*.zip' -printf '%f\n' 2>/dev/null | sort -V | tail -n1 || true)
+          OLD_ZIP="${OLD_ZIP:-}"
+          echo "📦 仓库现有源码包：${OLD_ZIP:-（无）}"
+
+          # 从现有包名推断“当前版本”，用作探测起点；解析失败则回退到 11.0
+          CUR_MAJOR=11
+          CUR_MINOR=0
+          if [ -n "$OLD_ZIP" ]; then
+            VER="$(basename "$OLD_ZIP" .zip)"
+            VER="${VER##*-v}"
+            MAYOR="${VER%%.*}"
+            if [[ "$MAYOR" =~ ^[0-9]+$ ]]; then CUR_MAJOR="$MAYOR"; fi
+            REST="${VER#*.}"
+            if [ "$REST" != "$VER" ]; then
+              MINOR="${REST%%.*}"
+              if [[ "$MINOR" =~ ^[0-9]+$ ]]; then CUR_MINOR="$MINOR"; fi
+            fi
+          fi
+          echo "🔎 当前基准版本：v${CUR_MAJOR}.${CUR_MINOR}"
+
+          ZIP_URL=""
+          VERSION=""
+
+          if [ -n "$MANUAL" ]; then
+            # 手动指定地址（仓库变量 YSP_SOURCE_URL 或 workflow_dispatch 输入）优先
+            ZIP_URL="$MANUAL"
+            VERSION="$(printf '%s' "$MANUAL" | sed -n 's#.*ysp-live-docker-v\([0-9][0-9.]*\)\.zip#\1#p')"
+            VERSION="${VERSION:-unknown}"
+            echo "🔗 使用手动指定地址：$ZIP_URL"
+          else
+            # 探测某个版本是否存在（上游只有“当前版本”这一份文件，旧版本会被删除）
+            probe() {
+              local code
+              code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 -I \
+                     "$BASE/ysp-live-docker-v$1.$2.zip" 2>/dev/null || true)
+              case "$code" in
+                200) return 0 ;;
+                # 个别对象存储不允许 HEAD，用 Range 请求再确认一次
+                403|405|501)
+                  code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 -r 0-0 \
+                         "$BASE/ysp-live-docker-v$1.$2.zip" 2>/dev/null || true)
+                  case "$code" in
+                    200|206) return 0 ;;
+                    *) return 1 ;;
+                  esac
+                  ;;
+                *) return 1 ;;
+              esac
+            }
+
+            START=$(( CUR_MINOR > 2 ? CUR_MINOR - 2 : 0 ))
+            END=$(( CUR_MINOR + MAX_PROBES ))
+            echo "🔎 并行探测 v${CUR_MAJOR}.${START} ~ v${CUR_MAJOR}.${END} ..."
+
+            : > /tmp/ysp-found.txt
+            for m in $(seq "$START" "$END"); do
+              ( probe "$CUR_MAJOR" "$m" && echo "$m" >> /tmp/ysp-found.txt ) &
+            done
+            wait
+
+            BEST_MINOR=$(sort -n /tmp/ysp-found.txt 2>/dev/null | tail -n1 || true)
+            if [ -n "$BEST_MINOR" ]; then
+              ZIP_URL="$BASE/ysp-live-docker-v${CUR_MAJOR}.${BEST_MINOR}.zip"
+              VERSION="${CUR_MAJOR}.${BEST_MINOR}"
+            fi
+
+            # 大版本可能升级（v11 → v12），从高到低试几个小版本
+            for m in 3 2 1 0; do
+              if probe "$((CUR_MAJOR + 1))" "$m"; then
+                ZIP_URL="$BASE/ysp-live-docker-v$((CUR_MAJOR + 1)).${m}.zip"
+                VERSION="$((CUR_MAJOR + 1)).${m}"
+                break
+              fi
+            done
+          fi
+
+          # 上游探测失败：有旧包就跳过（不报红），没有旧包才真正失败
+          if [ -z "$ZIP_URL" ]; then
+            if [ -n "$OLD_ZIP" ]; then
+              echo "::warning::上游未探测到可下载的源码包，本次跳过（保留仓库现有 ${OLD_ZIP}）"
+              {
+                echo "version=v${CUR_MAJOR}.${CUR_MINOR}"
+                echo "zip_url="
+                echo "file=${OLD_ZIP}"
+                echo "sha256="
+                echo "short_sha="
+                echo "changed=false"
+              } >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "::error::未能定位上游源码包（v${CUR_MAJOR}.* 均不可用），请检查 BASE_URL，或用 source_url 手动指定地址"
             exit 1
           fi
-          # 计算文件的 SHA256 哈希值
-          HASH=$(sha256sum "$ZIP_FILE" | awk '{print $1}')
-          echo "zip_hash=$HASH" >> $GITHUB_OUTPUT
-          echo "🔍 找到源码包: $ZIP_FILE"
-          echo "🔑 计算出的指纹: $HASH"
 
-      - name: 3. 检查该文件是否已经构建过
-        id: cache-check
-        uses: actions/cache@v4
-        with:
-          # 我们不需要缓存文件，只需要利用 cache 的 key 来记录状态
-          path: /tmp/build-marker
-          key: ysp-build-${{ steps.get-hash.outputs.zip_hash }}
+          echo "🎯 上游最新：v${VERSION} → ${ZIP_URL}"
+
+          # ---------------- 下载 + 校验 ----------------
+          TMP_ZIP=/tmp/ysp-upstream.zip
+          # 统一成 ysp-live-docker-vX.Y.zip 的命名，便于下次比对
+          if [ "$VERSION" != "unknown" ]; then
+            NEW_NAME="ysp-live-docker-v${VERSION}.zip"
+          else
+            NEW_NAME="$(basename "$ZIP_URL")"
+          fi
+
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --max-time 300 -o "$TMP_ZIP" "$ZIP_URL"
+          SIZE=$(stat -c%s "$TMP_ZIP")
+          echo "📦 下载完成：${NEW_NAME}（${SIZE} 字节）"
+
+          if [ "$SIZE" -lt 1024 ]; then
+            echo "::error::下载文件过小（${SIZE} 字节），上游可能返回了错误页面"
+            exit 1
+          fi
+          if ! unzip -tq "$TMP_ZIP" >/dev/null 2>&1; then
+            echo "::error::下载的文件不是有效的 ZIP"
+            exit 1
+          fi
+          if ! unzip -Z1 "$TMP_ZIP" | grep -qiE '(^|/)Dockerfile$'; then
+            echo "::error::ZIP 包内没有 Dockerfile，无法构建"
+            exit 1
+          fi
+
+          NEW_SHA=$(sha256sum "$TMP_ZIP" | awk '{print $1}')
+          SHORT_SHA="${NEW_SHA:0:12}"
+          echo "🔑 SHA256：$NEW_SHA"
+
+          # ---------------- 与仓库现有包比对 ----------------
+          CHANGED=false
+          if [ -z "$OLD_ZIP" ]; then
+            CHANGED=true
+            echo "🆕 仓库内还没有源码包，需要构建"
+          else
+            OLD_SHA=$(sha256sum "$OLD_ZIP" | awk '{print $1}')
+            if [ "$OLD_SHA" != "$NEW_SHA" ]; then CHANGED=true; fi
+            if [ "$OLD_ZIP" != "$NEW_NAME" ]; then CHANGED=true; fi
+            if [ "$CHANGED" = "true" ]; then
+              echo "🔄 检测到更新：${OLD_ZIP}（${OLD_SHA:0:12}）→ ${NEW_NAME}（${SHORT_SHA}）"
+            else
+              echo "✅ 上游版本未变化（${NEW_SHA}），本次只做检查，不重复构建"
+            fi
+          fi
+
+          {
+            echo "version=v${VERSION}"
+            echo "zip_url=${ZIP_URL}"
+            echo "file=${NEW_NAME}"
+            echo "sha256=${NEW_SHA}"
+            echo "short_sha=${SHORT_SHA}"
+            echo "changed=${CHANGED}"
+          } >> "$GITHUB_OUTPUT"
+
+      # ---------------------------------------------------------------------
+      # 有新版本：同步 ZIP → 解压 → 构建推送 → 提交回仓库
+      # （先构建成功再提交，避免构建失败却把 zip 记成“已处理”）
+      # ---------------------------------------------------------------------
+      - name: 3. 把新源码包放进工作目录
+        if: steps.detect.outputs.changed == 'true'
+        env:
+          NEW_NAME: ${{ steps.detect.outputs.file }}
+        run: |
+          set -euo pipefail
+          rm -f ysp-live-docker-v*.zip
+          cp /tmp/ysp-upstream.zip "$NEW_NAME"
+          ls -l "$NEW_NAME"
 
       - name: 4. 解压源码并铺平到根目录
-        # 如果缓存命中 (以前构建过这个文件)，则跳过所有后续步骤
-        if: steps.cache-check.outputs.cache-hit != 'true'
+        if: steps.detect.outputs.changed == 'true' || inputs.force_build == true
         run: |
-          ZIP_FILE=$(ls *.zip | head -n 1)
-          unzip -o "$ZIP_FILE" -d /tmp/unzip
+          set -euo pipefail
+          SRC=/tmp/ysp-upstream.zip
+          if [ ! -f "$SRC" ]; then
+            # 仅在“强制重建但上游暂时探测失败”时走这里：退回仓库里已有的 zip
+            SRC=$(find . -maxdepth 1 -type f -name 'ysp-live-docker-v*.zip' -print | sort -V | tail -n1)
+            [ -n "$SRC" ] || { echo "::error::没有可用的源码包，无法构建"; exit 1; }
+            echo "⚠️ 上游源码包不可用，改用仓库内的 $SRC"
+          fi
+          rm -rf /tmp/unzip && mkdir -p /tmp/unzip
+          unzip -q -o "$SRC" -d /tmp/unzip
           find /tmp/unzip -type f -exec cp -a {} . \;
           echo "✅ 提取完成，当前根目录包含以下核心文件："
-          ls -la | grep -E "Dockerfile|\.py|\.js"
+          ls -la Dockerfile ./*.py ./*.js 2>/dev/null || true
 
-      - name: 5. 设置 Docker Buildx (多平台构建)
-        if: steps.cache-check.outputs.cache-hit != 'true'
+      - name: 5. 设置 QEMU（arm64 模拟）
+        if: steps.detect.outputs.changed == 'true' || inputs.force_build == true
+        uses: docker/setup-qemu-action@v3
+
+      - name: 6. 设置 Docker Buildx（多平台构建）
+        if: steps.detect.outputs.changed == 'true' || inputs.force_build == true
         uses: docker/setup-buildx-action@v3
 
-      - name: 6. 登录 GitHub 镜像仓库
-        if: steps.cache-check.outputs.cache-hit != 'true'
+      - name: 7. 登录 GitHub 镜像仓库
+        if: steps.detect.outputs.changed == 'true' || inputs.force_build == true
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 7. 生成镜像标签
-        if: steps.cache-check.outputs.cache-hit != 'true'
+      - name: 8. 生成镜像标签
         id: meta
+        if: steps.detect.outputs.changed == 'true' || inputs.force_build == true
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
             type=raw,value=latest
-            # 同时打上一个基于哈希值的标签，方便追溯是哪个文件版本打的包
-            type=raw,value=build-${{ steps.get-hash.outputs.zip_hash }}
+            # 版本标签，例如 v11.3，方便固定版本部署
+            type=raw,value=${{ steps.detect.outputs.version }}
+            # 内容指纹标签，方便追溯是哪个 zip 打的包
+            type=raw,value=build-${{ steps.detect.outputs.short_sha }}
+          labels: |
+            org.opencontainers.image.title=ysp-live
+            org.opencontainers.image.version=${{ steps.detect.outputs.version }}
+            org.opencontainers.image.revision=${{ steps.detect.outputs.sha256 }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
 
-      - name: 8. 构建并推送镜像
-        if: steps.cache-check.outputs.cache-hit != 'true'
-        uses: docker/build-push-action@v5
+      - name: 9. 构建并推送镜像
+        if: steps.detect.outputs.changed == 'true' || inputs.force_build == true
+        uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          file: ./Dockerfile
+          platforms: ${{ env.PLATFORMS }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: 9. 记录构建成功状态
-        if: steps.cache-check.outputs.cache-hit != 'true'
+      - name: 10. 把新源码包提交回仓库
+        if: steps.detect.outputs.changed == 'true'
+        env:
+          VERSION: ${{ steps.detect.outputs.version }}
+          SHA256: ${{ steps.detect.outputs.sha256 }}
         run: |
-          # 生成一个空文件，让 actions/cache 能够在任务结束时成功保存这个 hash
-          mkdir -p /tmp/build-marker
-          echo "done" > /tmp/build-marker/success
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # 只暂存 zip 相关变更，解压出来的源码文件保持未跟踪，不提交
+          git add -A -- '*.zip'
+          if git diff --cached --quiet; then
+            echo "仓库中的源码包已是最新，无需提交"
+            exit 0
+          fi
+          git commit -m "chore: 更新 YSP-Live 源码包至 ${VERSION}" -m "sha256: ${SHA256}"
+
+          for i in 1 2 3; do
+            if git push origin "HEAD:${GITHUB_REF_NAME}"; then
+              echo "✅ 已提交并推送到 ${GITHUB_REF_NAME}"
+              exit 0
+            fi
+            echo "⚠️ 第 ${i} 次推送失败，拉取远端后重试 ..."
+            git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
+            sleep 5
+          done
+          echo "::error::推送源码包到仓库失败"
+          exit 1
+
+      # ---------------------------------------------------------------------
+      # 保活：公开仓库连续 60 天没有任何提交，GitHub 会自动停用定时任务。
+      # 上游两个月不更新时，这里补一个很小的提交，避免自动化静默失效。
+      # 不需要的话整段删掉即可。
+      # ---------------------------------------------------------------------
+      - name: 11. 保活提交（防止定时任务被 GitHub 停用）
+        if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+        env:
+          KEEPALIVE_FILE: .github/keepalive
+        run: |
+          set -euo pipefail
+          today=$(date -u +%F)
+          last=""
+          if [ -f "$KEEPALIVE_FILE" ]; then
+            last=$(tr -d '[:space:]' < "$KEEPALIVE_FILE")
+          fi
+
+          need_commit=false
+          if [[ "$last" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            age=$(( ( $(date -u -d "$today" +%s) - $(date -u -d "$last" +%s) ) / 86400 ))
+            echo "上次保活提交：${last}（${age} 天前）"
+            [ "$age" -ge 45 ] && need_commit=true
+          else
+            echo "还没有保活记录"
+            need_commit=true
+          fi
+
+          if [ "$need_commit" = false ]; then
+            echo "✅ 保活记录仍然新鲜（阈值 45 天），无需提交"
+            exit 0
+          fi
+
+          mkdir -p "$(dirname "$KEEPALIVE_FILE")"
+          printf '%s\n' "$today" > "$KEEPALIVE_FILE"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$KEEPALIVE_FILE"
+          git commit -m "chore: 保活提交（避免定时任务因 60 天无提交被自动停用）"
+
+          for i in 1 2 3; do
+            if git push origin "HEAD:${GITHUB_REF_NAME}"; then
+              echo "✅ 保活提交已推送"
+              exit 0
+            fi
+            echo "⚠️ 第 ${i} 次推送失败，稍后重试 ..."
+            git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
+            sleep 5
+          done
+          echo "::warning::保活提交推送失败（不影响本次构建结果）"
+
+      # ---------------------------------------------------------------------
+      # 运行摘要
+      # ---------------------------------------------------------------------
+      - name: 12. 写入运行摘要
+        if: always()
+        env:
+          VERSION: ${{ steps.detect.outputs.version }}
+          ZIP_URL: ${{ steps.detect.outputs.zip_url }}
+          FILE_NAME: ${{ steps.detect.outputs.file }}
+          SHA256: ${{ steps.detect.outputs.sha256 }}
+          CHANGED: ${{ steps.detect.outputs.changed }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          {
+            echo "## YSP-Live 构建结果"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "| --- | --- |"
+            echo "| 上游版本 | \`${VERSION:-未知}\` |"
+            echo "| 源码地址 | ${ZIP_URL:-（未探测到）} |"
+            echo "| 源码文件 | \`${FILE_NAME:-—}\` |"
+            echo "| SHA256 | \`${SHA256:-—}\` |"
+            echo "| 是否变化 | ${CHANGED:-unknown} |"
+            echo "| 触发方式 | \`${GITHUB_EVENT_NAME}\` |"
+            echo ""
+            if [ -n "${TAGS:-}" ]; then
+              echo "### 已推送镜像标签"
+              echo '```'
+              echo "$TAGS"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

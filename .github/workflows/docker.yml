@@ -3,7 +3,7 @@
 # -----------------------------------------------------------------------------
 # 相比旧版的变化：不再需要手动下载 zip 再上传到本仓库。
 # 每次运行都会：
-#   1) 自动探测上游最新版本（形如 ysp-live-docker-v11.3.zip）
+#   1) 自动探测上游最新版本（形如 ysp-live-docker-v11.3.zip 或 ysp-live-docker-v20261124.zip）
 #   2) 下载并校验（ZIP 完整性 + 是否含 Dockerfile）+ 计算 SHA256
 #   3) 与仓库里已有的同版本包比对，只有变化时才构建
 #   4) 构建并推送多架构镜像到 ghcr.io，打完标签后把新 zip 提交回仓库
@@ -45,8 +45,10 @@ concurrency:
 env:
   # 上游目录（末尾不要带斜杠）；也可在仓库 Settings → Variables 里用 YSP_SOURCE_URL 覆盖成固定地址
   BASE_URL: 'https://garysclub.sharewithyou.dpdns.org/ysp-live'
-  # 从当前版本往后最多探测多少个小版本（vX.当前..vX.当前+N）
+  # 旧命名 “vX.Y” 时，向后探测多少个小版本
   MAX_MINOR_PROBES: '30'
+  # 新命名 “vYYYYMMDD” 时，若仓库里还是旧版本，则回扫多少天
+  LOOKBACK_DAYS: '120'
   # 构建平台，按需改成 linux/amd64 可显著缩短构建时间
   PLATFORMS: 'linux/amd64,linux/arm64'
 
@@ -82,21 +84,17 @@ jobs:
           OLD_ZIP="${OLD_ZIP:-}"
           echo "📦 仓库现有源码包：${OLD_ZIP:-（无）}"
 
-          # 从现有包名推断“当前版本”，用作探测起点；解析失败则回退到 11.0
-          CUR_MAJOR=11
-          CUR_MINOR=0
+          # 从现有包名推断“当前版本”，用于决定探测起点。上游先后用过两种命名：
+          #   ysp-live-docker-v11.3.zip       （旧：数字版本）
+          #   ysp-live-docker-v20261124.zip   （新：日期版本，YYYYMMDD）
+          CUR_VERSION=""
           if [ -n "$OLD_ZIP" ]; then
-            VER="$(basename "$OLD_ZIP" .zip)"
-            VER="${VER##*-v}"
-            MAYOR="${VER%%.*}"
-            if [[ "$MAYOR" =~ ^[0-9]+$ ]]; then CUR_MAJOR="$MAYOR"; fi
-            REST="${VER#*.}"
-            if [ "$REST" != "$VER" ]; then
-              MINOR="${REST%%.*}"
-              if [[ "$MINOR" =~ ^[0-9]+$ ]]; then CUR_MINOR="$MINOR"; fi
-            fi
+            CUR_VERSION="$(basename "$OLD_ZIP" .zip)"
+            CUR_VERSION="${CUR_VERSION##*-v}"
           fi
-          echo "🔎 当前基准版本：v${CUR_MAJOR}.${CUR_MINOR}"
+          echo "🔎 当前基准版本：${CUR_VERSION:-（未知）}"
+
+          TODAY="$(date -u +%Y%m%d)"
 
           ZIP_URL=""
           VERSION=""
@@ -108,57 +106,98 @@ jobs:
             VERSION="${VERSION:-unknown}"
             echo "🔗 使用手动指定地址：$ZIP_URL"
           else
-            # 探测某个版本是否存在（上游只有“当前版本”这一份文件，旧版本会被删除）
-            # 用 Range GET（只取 1 字节）而不是 HEAD：不少 WAF 会拦 HEAD，GET 才是真实下载路径
-            probe() {
+            FOUND=/tmp/ysp-found-versions.txt
+            : > "$FOUND"
+
+            # 统一探针：Range GET 只取 1 字节。
+            # 不用 HEAD —— Cloudflare 会对 HEAD / 非浏览器请求回 403 挑战（cf-mitigated: challenge），
+            # 而 GET 才是真实下载走的路径，带浏览器 UA 才能通过。
+            probe_file() {   # $1=文件名  $2=版本标识
               local url code
-              url="$BASE/ysp-live-docker-v$1.$2.zip"
+              url="$BASE/$1"
               code=$(curl -sS --connect-timeout 10 --max-time 25 -o /dev/null \
-                       -w '%{http_code}' -A "$UA" -H 'Accept: */*' -r 0-0 \
-                       "$url" 2>/dev/null || true)
+                       -w '%{http_code}' -A "$UA" -H 'Accept: */*' -r 0-0 "$url" 2>/dev/null || true)
               code="${code:-000}"
-              printf 'v%s.%s %s\n' "$1" "$2" "$code" >> "$CODES"
-              case "$code" in
-                200|206) return 0 ;;
-                *) return 1 ;;
-              esac
+              printf '%s %s\n' "$2" "$code" >> "$CODES"
+              if [ "$code" = "200" ] || [ "$code" = "206" ]; then
+                printf '%s\t%s\n' "$2" "$url" >> "$FOUND"
+              fi
+              return 0
             }
 
-            START=$(( CUR_MINOR > 2 ? CUR_MINOR - 2 : 0 ))
-            END=$(( CUR_MINOR + MAX_PROBES ))
-            echo "🔎 并行探测 v${CUR_MAJOR}.${START} ~ v${CUR_MAJOR}.${END} ..."
+            # ---------- 第 1 种命名：日期版 ysp-live-docker-vYYYYMMDD.zip ----------
+            if [[ "$CUR_VERSION" =~ ^[0-9]{8}$ ]]; then
+              # 仓库里已经是日期版本 → 只从它的前一天开始扫，通常只有 1~3 个请求
+              START_DATE="$(date -u -d "${CUR_VERSION:0:4}-${CUR_VERSION:4:2}-${CUR_VERSION:6:2} -1 day" +%Y-%m-%d)"
+            else
+              # 仓库里是旧数字版本 / 首次运行 → 回扫一段时间
+              START_DATE="$(date -u -d "${LOOKBACK_DAYS} days ago" +%Y-%m-%d)"
+            fi
+            END_DATE="$(date -u -d '+1 day' +%Y-%m-%d)"
 
-            : > /tmp/ysp-found.txt
-            for m in $(seq "$START" "$END"); do
-              ( probe "$CUR_MAJOR" "$m" && echo "$m" >> /tmp/ysp-found.txt ) &
+            S_EPOCH=$(date -u -d "$START_DATE" +%s)
+            E_EPOCH=$(date -u -d "$END_DATE" +%s)
+            if [ "$S_EPOCH" -gt "$E_EPOCH" ]; then
+              START_DATE="$(date -u -d "${LOOKBACK_DAYS} days ago" +%Y-%m-%d)"
+              S_EPOCH=$(date -u -d "$START_DATE" +%s)
+            fi
+            N_DAYS=$(( (E_EPOCH - S_EPOCH) / 86400 + 1 ))
+            echo "🗓  日期命名探测：${START_DATE} ~ ${END_DATE}（${N_DAYS} 个候选，含明天以防时区偏差）"
+
+            i=0
+            for (( t=S_EPOCH; t<=E_EPOCH; t+=86400 )); do
+              d="$(date -u -d "@$t" +%Y%m%d)"
+              ( probe_file "ysp-live-docker-v${d}.zip" "$d" ) &
+              i=$(( i + 1 ))
+              if [ $(( i % 16 )) -eq 0 ]; then wait; fi
             done
             wait
 
-            BEST_MINOR=$(sort -n /tmp/ysp-found.txt 2>/dev/null | tail -n1 || true)
-            if [ -n "$BEST_MINOR" ]; then
-              ZIP_URL="$BASE/ysp-live-docker-v${CUR_MAJOR}.${BEST_MINOR}.zip"
-              VERSION="${CUR_MAJOR}.${BEST_MINOR}"
+            BEST_DATE="$(awk -F'\t' '{print $1}' "$FOUND" | grep -E '^[0-9]{8}$' | sort -n | tail -n1 || true)"
+            if [ -n "$BEST_DATE" ]; then
+              ZIP_URL="$(awk -F'\t' -v v="$BEST_DATE" '$1==v {print $2; exit}' "$FOUND")"
+              VERSION="$BEST_DATE"
             fi
 
-            # 大版本可能升级（v11 → v12），从高到低试几个小版本
-            for m in 3 2 1 0; do
-              if probe "$((CUR_MAJOR + 1))" "$m"; then
-                ZIP_URL="$BASE/ysp-live-docker-v$((CUR_MAJOR + 1)).${m}.zip"
-                VERSION="$((CUR_MAJOR + 1)).${m}"
-                break
+            # ---------- 第 2 种命名（回退）：数字版 ysp-live-docker-vX.Y.zip ----------
+            if [ -z "$ZIP_URL" ]; then
+              NUM_MAJOR=11
+              NUM_MINOR=0
+              if [[ "$CUR_VERSION" =~ ^[0-9]+\.[0-9]+$ ]]; then
+                NUM_MAJOR="${CUR_VERSION%%.*}"
+                NUM_MINOR="${CUR_VERSION#*.}"
               fi
-            done
+              NSTART=$(( NUM_MINOR > 2 ? NUM_MINOR - 2 : 0 ))
+              NEND=$(( NUM_MINOR + MAX_PROBES ))
+              echo "🔢 回退探测数字命名：v${NUM_MAJOR}.${NSTART} ~ v${NUM_MAJOR}.${NEND}"
+
+              for m in $(seq "$NSTART" "$NEND"); do
+                ( probe_file "ysp-live-docker-v${NUM_MAJOR}.${m}.zip" "${NUM_MAJOR}.${m}" ) &
+              done
+              # 大版本可能升级（v11 → v12），从高到低试几个小版本
+              for m in 3 2 1 0; do
+                ( probe_file "ysp-live-docker-v$((NUM_MAJOR + 1)).${m}.zip" "$((NUM_MAJOR + 1)).${m}" ) &
+              done
+              wait
+
+              BEST_NUM="$(awk -F'\t' '{print $1}' "$FOUND" | sort -V | tail -n1 || true)"
+              if [ -n "$BEST_NUM" ]; then
+                ZIP_URL="$(awk -F'\t' -v v="$BEST_NUM" '$1==v {print $2; exit}' "$FOUND")"
+                VERSION="$BEST_NUM"
+              fi
+            fi
           fi
 
           # 上游探测失败：把诊断信息写进 Step Summary，方便直接定位原因
           if [ -z "$ZIP_URL" ]; then
-            SAMPLE_URL="$BASE/ysp-live-docker-v${CUR_MAJOR}.${CUR_MINOR}.zip"
+            SAMPLE_URL="$BASE/ysp-live-docker-v${TODAY}.zip"
             {
               echo "### 🔍 上游探测诊断"
               echo ""
               echo '```text'
               echo "探测目标   : $BASE"
               echo -n "DNS 解析   : "; getent ahosts "$HOST" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ' || true; echo
+              echo "已尝试日期 : ${START_DATE:-—} ~ ${END_DATE:-—}，数字命名 v11.0 ~ v11.$MAX_PROBES（回退）"
               echo "状态码分布 : $(awk '{print $2}' "$CODES" | sort | uniq -c | awk '{printf "%s×%s ", $2, $1}')"
               echo -n "无 UA 的 Range GET : "
               curl -sS -o /dev/null -w '%{http_code} (耗时 %{time_total}s)\n' --connect-timeout 10 --max-time 25 \
@@ -168,18 +207,19 @@ jobs:
                    --connect-timeout 10 --max-time 60 -A "$UA" "$SAMPLE_URL" 2>&1 || echo "curl 失败"
               echo -n "对照: runner 出口 IP : "; curl -sS --max-time 15 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -E '^(ip|loc|colo)=' | tr '\n' ' ' || true; echo
               echo "响应头:"
-              curl -sS -D - -o /dev/null --connect-timeout 10 --max-time 25 -r 0-0 "$SAMPLE_URL" 2>&1 | head -15 || true
+              curl -sS -D - -o /dev/null --connect-timeout 10 --max-time 25 -A "$UA" -r 0-0 "$SAMPLE_URL" 2>&1 | head -15 || true
               echo '```'
               echo ""
-              echo "> 403 / challenge → 上游 CDN 拦截了 GitHub Actions 的出口 IP"
+              echo "> 全部 404 → 上游命名规则又变了（看 diagnostic 里「已尝试日期」范围是否覆盖）"
+              echo "> 403 + cf-mitigated: challenge → Cloudflare 对非浏览器请求发起挑战"
               echo "> 000 / DNS 为空 → runner 解析不到或连不上该域名"
-              echo "> 200 → 探测逻辑问题（把这段贴给我）"
+              echo "> 有 200 → 探测逻辑问题（把这段贴给我）"
             } | tee /tmp/ysp-diag.txt >> "$GITHUB_STEP_SUMMARY"
 
             if [ -n "$OLD_ZIP" ]; then
               echo "::warning::上游未探测到可下载的源码包，本次跳过（保留仓库现有 ${OLD_ZIP}），诊断见 Step Summary"
               {
-                echo "version=v${CUR_MAJOR}.${CUR_MINOR}"
+                echo "version=v${CUR_VERSION:-unknown}"
                 echo "zip_url="
                 echo "file=${OLD_ZIP}"
                 echo "sha256="
@@ -188,7 +228,7 @@ jobs:
               } >> "$GITHUB_OUTPUT"
               exit 0
             fi
-            echo "::error::未能定位上游源码包（v${CUR_MAJOR}.* 均不可用），诊断见 Step Summary；也可用 source_url 手动指定地址"
+            echo "::error::未能定位上游源码包（日期命名与数字命名均未命中），诊断见 Step Summary；也可用 source_url 手动指定地址"
             exit 1
           fi
 
@@ -196,7 +236,7 @@ jobs:
 
           # ---------------- 下载 + 校验 ----------------
           TMP_ZIP=/tmp/ysp-upstream.zip
-          # 统一成 ysp-live-docker-vX.Y.zip 的命名，便于下次比对
+          # 统一成 ysp-live-docker-v<版本>.zip 的命名，便于下次比对
           if [ "$VERSION" != "unknown" ]; then
             NEW_NAME="ysp-live-docker-v${VERSION}.zip"
           else
@@ -305,7 +345,7 @@ jobs:
           images: ghcr.io/${{ github.repository }}
           tags: |
             type=raw,value=latest
-            # 版本标签，例如 v11.3，方便固定版本部署
+            # 版本标签，例如 v20261124，方便固定版本部署
             type=raw,value=${{ steps.detect.outputs.version }}
             # 内容指纹标签，方便追溯是哪个 zip 打的包
             type=raw,value=build-${{ steps.detect.outputs.short_sha }}
